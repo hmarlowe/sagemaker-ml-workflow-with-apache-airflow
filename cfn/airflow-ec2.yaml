@@ -7,10 +7,6 @@ Parameters:
     Description: Name of an existing EC2 KeyPair to enable SSH access into the Airflow web server
     Type: AWS::EC2::KeyPair::KeyName
     ConstraintDescription: Must be the name of an existing EC2 KeyPair
-  S3BucketName:
-    Description: REQUIRED - A new S3 Bucket name. This bucket will be used by Sagemaker for reading and writing model artifacts or hosting data
-    Type: String
-    AllowedPattern: ".+"
   DBPassword:
     NoEcho: "true"
     Description: Airflow database admin account password
@@ -19,6 +15,26 @@ Parameters:
     MaxLength: "41"
     AllowedPattern: "[a-zA-Z0-9]*"
     ConstraintDescription: Must contain only alphanumeric characters
+  VpcCIDR:
+      Description: Please enter the IP range (CIDR notation) for this VPC
+      Type: String
+      Default: 10.0.0.0/16
+  PublicSubnet1CIDR:
+      Description: Please enter the IP range (CIDR notation) for the public subnet in the 1st Availability Zone
+      Type: String
+      Default: 10.0.0.0/24
+  PublicSubnet2CIDR:
+      Description: Please enter the IP range (CIDR notation) for the public subnet in the 2nd Availability Zone
+      Type: String
+      Default: 10.0.2.0/24
+  PrivateSubnet1CIDR:
+      Description: Please enter the IP range (CIDR notation) for the private subnet in the 1st Availability Zone
+      Type: String
+      Default: 10.0.1.0/24
+  PrivateSubnet2CIDR:
+      Description: Please enter the IP range (CIDR notation) for the private subnet in the 2nd Availability Zone
+      Type: String
+      Default: 10.0.3.0/24
 
 # Mapping to find the Amazon Linux AMI in each region.
 Mappings:
@@ -48,21 +64,29 @@ Mappings:
     sa-east-1:
       AMI: "ami-07b14488da8ea02a0"
     us-east-1:
-      AMI: "ami-0ff8a91507f77f867"
+      AMI: "ami-0b898040803850657"
     us-east-2:
       AMI: "ami-0b59bfac6be064b78"
     us-west-1:
       AMI: "ami-0bdb828fd58c52235"
     us-west-2:
       AMI: "ami-a0cfeed8"
-
 Resources:
+  Type: AWS::SSM::Parameter
+  Properties: 
+    AllowedPattern: String
+    Description: String
+    Name: String
+    Type: SecureString
+    Value: !Ref DBPassword
   EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
       KeyName: !Ref "KeyName"
-      SecurityGroups: [!Ref "AirflowEC2SecurityGroup"]
+      SecurityGroupIds: 
+        - !Ref AirflowEC2SecurityGroup
       InstanceType: "m4.xlarge"
+      SubnetId: !Ref PublicSubnet1
       IamInstanceProfile:
         Ref: EC2InstanceProfile
       Tags:
@@ -77,45 +101,28 @@ Resources:
           #!/bin/bash
           set -x
           exec > >(tee /var/log/user-data.log|logger -t user-data ) 2>&1
-          # Get latest version of pip (pip 10 breaks airflow installation hence moving to stable pip version)
-          python -m pip install pip==9.0.3 --user
-          # Get the latest CloudFormation package
-          echo "Installing aws-cfn"
-          yum install -y aws-cfn-bootstrap
+          #
           # Start cfn-init
           /opt/aws/bin/cfn-init -v -c install --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
-          # Install git
-          echo "Installing git"
-          sudo yum install -y git
-          # Install boto3
-          echo "Updating boto3"
-          python -m pip install boto3 --upgrade --user
-          # Upgrade awscli
-          echo "Updating awscli"
-          python -m pip install awscli --upgrade --user
+          # Install pip and setuptools
+          yum install -y python-pip python python-setuptools
           # Install airflow using pip
+          yum group install -y "Development Tools"
           echo "Installing Apache Airflow"
+          export AIRFLOW_HOME=~/airflow
           export AIRFLOW_GPL_UNIDECODE=yes
-          python -m pip install apache-airflow --user
           # Encrypt connection passwords in metadata db
-          python -m pip install apache-airflow[crypto] --user
-          # Postgres operators and hook, support as an Airflow backend
-          python -m pip install apache-airflow[postgres] --user
-          python -m pip install six==1.10.0 --user
-          python -m pip install --upgrade six --user
-          python -m pip install markupsafe --user
-          python -m pip install --upgrade MarkupSafe --user
+          python -m pip install --upgrade apache-airflow[crypto,postgres,s3] --user
+          python -m pip install --upgrade six markupsafe psycopg2==2.7.3.2 --user
           echo 'export PATH=/usr/local/bin:~/.local/bin:$PATH' >> ~/.bash_profile
           source ~/.bash_profile
           # Install pandas and numpy for data processing
-          echo "Installing numpy"
-          python -m pip install --upgrade numpy --user
-          echo "Installing pandas"
-          python -m pip install --upgrade pandas --user
-          echo "Installing s3fs"
-          python -m pip install --upgrade s3fs --user
-          echo "Installing sagemaker sdk"
-          python -m pip install sagemaker --user
+          echo "Installing py dependencies"
+          python -m pip install --upgrade numpy pandas s3fs sagemaker boto3 --user
+          echo "Pinning Flask version to avoid json error"
+          python -m pip install Flask==1.0.4 --user
+          echo "Upgrading werkzeug version due to depreciation"
+          python -m pip install werkzeug>=0.15.0 --user
           # Initialize Airflow
           airflow initdb
           # Update the RDS connection in the Airflow Config file
@@ -143,11 +150,13 @@ Resources:
           mkdir -p ~/airflow/dags/sm-ml-pipeline
           # clone the git repository
           cd ~
-          git clone https://github.com/aws-samples/sagemaker-ml-workflow-with-apache-airflow.git
+          git clone --single-branch --branch update-blog https://github.com/hmarlowe/sagemaker-ml-workflow-with-apache-airflow.git
+          #git clone https://github.com/aws-samples/sagemaker-ml-workflow-with-apache-airflow.git
           mv ~/sagemaker-ml-workflow-with-apache-airflow ~/sm-ml-pipeline
           cd ~/sm-ml-pipeline/src
           # prepare airflow dag definition for sagemaker blog post
-          sed -i 's/<s3-bucket>/${S3BucketName}/g' ./*.*
+          sed -i 's/<execution-role>/${AirflowSageMakerExecutionRole}/g' ./*.*
+          sed -i 's/<s3-bucket>/${S3Bucket}/g' ./*.*
           sed -i 's/<region-name>/${AWS::Region}/g' ./*.*
           zip -r dag.zip *
           cp dag.zip ~/airflow/dags/sm-ml-pipeline/dag.zip
@@ -178,13 +187,14 @@ Resources:
       MasterUserPassword: !Ref "DBPassword"
       DBInstanceClass: db.t2.small
       AllocatedStorage: 5
+      DBSubnetGroupName: !Ref DBSubnetGroup
       DBSecurityGroups:
         - Ref: DBSecurityGroup
   AirflowEC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: AirflowEC2SG
       GroupDescription: Enable HTTP access via port 80 + SSH access
+      VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
@@ -202,13 +212,22 @@ Resources:
     Type: AWS::RDS::DBSecurityGroup
     Properties:
       GroupDescription: Frontend Access
+      EC2VpcId: !Ref VPC
       DBSecurityGroupIngress:
-        EC2SecurityGroupName:
-          Ref: AirflowEC2SecurityGroup
+        EC2SecurityGroupId:
+          !GetAtt AirflowEC2SecurityGroup.GroupId
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties: 
+      DBSubnetGroupDescription: Subnets where RDS can be deployed
+      DBSubnetGroupName: RDSSubnetGroup
+      SubnetIds: 
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
   EC2Role:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: AirflowInstanceRole
+      RoleName: !Join ['-', [ Ref: 'AWS::StackName', 'AirflowInstanceRole' ]]
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -222,7 +241,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
       Policies:
-        - PolicyName: AirflowResourceAccess
+        - PolicyName: !Join ['-', [ Ref: 'AWS::StackName', 'AirflowResourceAccess' ]]
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -230,8 +249,8 @@ Resources:
                 Action:
                   - s3:*
                 Resource:
-                  - !Sub "arn:aws:s3:::${S3BucketName}"
-                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+                  - !Sub "arn:aws:s3:::${S3Bucket}"
+                  - !Sub "arn:aws:s3:::${S3Bucket}/*"
               - Effect: Allow
                 Action:
                   - iam:GetRole
@@ -239,19 +258,19 @@ Resources:
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
-      InstanceProfileName: AirflowInstanceProfile
+      InstanceProfileName: !Join ['-', [ Ref: 'AWS::StackName', 'AirflowInstanceProfile' ]]
       Roles:
         - Ref: EC2Role
   S3Bucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
+    DeletionPolicy: Delete
     Properties:
       AccessControl: BucketOwnerFullControl
-      BucketName: !Ref "S3BucketName"
+      BucketName: !Join ['-', [ Ref: 'AWS::StackName', 'airflowsagemakerbucket' ]]
   AirflowSageMakerExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: AirflowSageMakerExecutionRole
+      RoleName: !Join ['-', [ Ref: 'AWS::StackName', 'AirflowSageMakerExecutionRole' ]]
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -273,8 +292,168 @@ Resources:
                 Action:
                   - s3:*
                 Resource:
-                  - !Sub "arn:aws:s3:::${S3BucketName}"
-                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+                  - !Sub "arn:aws:s3:::${S3Bucket}"
+                  - !Sub "arn:aws:s3:::${S3Bucket}/*"
+
+  VPC:
+      Type: AWS::EC2::VPC
+      Properties:
+          CidrBlock: !Ref VpcCIDR
+          EnableDnsSupport: true
+          EnableDnsHostnames: true
+          Tags:
+              - Key: Name
+                Value: !Ref 'AWS::StackName'
+
+  InternetGateway:
+      Type: AWS::EC2::InternetGateway
+      Properties:
+          Tags:
+              - Key: Name
+                Value: !Ref 'AWS::StackName'
+
+  InternetGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+          InternetGatewayId: !Ref InternetGateway
+          VpcId: !Ref VPC
+
+  PublicSubnet1:
+      Type: AWS::EC2::Subnet
+      Properties:
+          VpcId: !Ref VPC
+          AvailabilityZone: !Select [ 0, !GetAZs ]
+          CidrBlock: !Ref PublicSubnet1CIDR
+          MapPublicIpOnLaunch: true
+          Tags:
+              - Key: Name
+                Value: !Join ['-', [ Ref: 'AWS::StackName', 'Public Subnet (AZ1)' ]]
+
+  PublicSubnet2:
+      Type: AWS::EC2::Subnet
+      Properties:
+          VpcId: !Ref VPC
+          AvailabilityZone: !Select [ 1, !GetAZs ]
+          CidrBlock: !Ref PublicSubnet2CIDR
+          MapPublicIpOnLaunch: true
+          Tags:
+              - Key: Name
+                Value: !Join ['-', [ Ref: 'AWS::StackName', 'Public Subnet (AZ2)' ]]
+
+  PrivateSubnet1:
+      Type: AWS::EC2::Subnet
+      Properties:
+          VpcId: !Ref VPC
+          AvailabilityZone: !Select [ 0, !GetAZs ]
+          CidrBlock: !Ref PrivateSubnet1CIDR
+          MapPublicIpOnLaunch: false
+          Tags:
+              - Key: Name
+                Value: !Join ['-', [ Ref: 'AWS::StackName', 'Private Subnet (AZ1)' ]]
+
+  PrivateSubnet2:
+      Type: AWS::EC2::Subnet
+      Properties:
+          VpcId: !Ref VPC
+          AvailabilityZone: !Select [ 1, !GetAZs ]
+          CidrBlock: !Ref PrivateSubnet2CIDR
+          MapPublicIpOnLaunch: false
+          Tags:
+              - Key: Name
+                Value: !Join ['-', [ Ref: 'AWS::StackName', 'Private Subnet (AZ2)' ]]
+
+  NatGateway1EIP:
+      Type: AWS::EC2::EIP
+      DependsOn: InternetGatewayAttachment
+      Properties:
+        Domain: vpc
+
+  NatGateway2EIP:
+      Type: AWS::EC2::EIP
+      DependsOn: InternetGatewayAttachment
+      Properties:
+        Domain: vpc
+
+  NatGateway1:
+      Type: AWS::EC2::NatGateway
+      Properties:
+          AllocationId: !GetAtt NatGateway1EIP.AllocationId
+          SubnetId: !Ref PublicSubnet1
+
+  NatGateway2:
+      Type: AWS::EC2::NatGateway
+      Properties:
+          AllocationId: !GetAtt NatGateway2EIP.AllocationId
+          SubnetId: !Ref PublicSubnet2
+
+  PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+          VpcId: !Ref VPC
+          Tags:
+              - Key: Name
+                Value: !Join ['-', [ Ref: 'AWS::StackName', 'Public Routes' ]]
+
+  DefaultPublicRoute:
+      Type: AWS::EC2::Route
+      DependsOn: InternetGatewayAttachment
+      Properties:
+          RouteTableId: !Ref PublicRouteTable
+          DestinationCidrBlock: 0.0.0.0/0
+          GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+          RouteTableId: !Ref PublicRouteTable
+          SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+          RouteTableId: !Ref PublicRouteTable
+          SubnetId: !Ref PublicSubnet2
+  PrivateRouteTable1:
+      Type: AWS::EC2::RouteTable
+      Properties:
+          VpcId: !Ref VPC
+          Tags:
+              - Key: Name
+                Value: !Join ['-', [ Ref: 'AWS::StackName', 'Private Routes (AZ1)' ]]
+
+  DefaultPrivateRoute1:
+      Type: AWS::EC2::Route
+      Properties:
+          RouteTableId: !Ref PrivateRouteTable1
+          DestinationCidrBlock: 0.0.0.0/0
+          NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+          RouteTableId: !Ref PrivateRouteTable1
+          SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+      Type: AWS::EC2::RouteTable
+      Properties:
+          VpcId: !Ref VPC
+          Tags:
+              - Key: Name
+                Value: !Join ['-', [ Ref: 'AWS::StackName', 'Private Routes (AZ2)' ]]
+
+  DefaultPrivateRoute2:
+      Type: AWS::EC2::Route
+      Properties:
+          RouteTableId: !Ref PrivateRouteTable2
+          DestinationCidrBlock: 0.0.0.0/0
+          NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+          RouteTableId: !Ref PrivateRouteTable2
+          SubnetId: !Ref PrivateSubnet2
 Outputs:
   AirflowEC2PublicDNSName:
     Description: Public DNS Name of the Airflow EC2 instance

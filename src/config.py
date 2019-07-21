@@ -24,7 +24,7 @@ config["prepare_data"] = {
 }
 
 config["train_model"] = {
-    "sagemaker_role": "AirflowSageMakerExecutionRole",
+    "sagemaker_role": "<execution-role>",
     "estimator_config": {
         "train_instance_count": 1,
         "train_instance_type": "ml.c5.4xlarge",
